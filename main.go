@@ -30,6 +30,7 @@ var (
 	httpClient         = &http.Client{Timeout: 5 * time.Second}
 	concurrencyLimiter = make(chan struct{}, 30)
 	bufferPool         = sync.Pool{New: func() interface{} { return &bytes.Buffer{} }}
+	batchProcessor     = make(chan SummaryItem, 10000)
 	
 	// Ultra-fast JSON for summary
 	jsonFast = jsoniter.ConfigCompatibleWithStandardLibrary
@@ -46,6 +47,14 @@ type PostPayments struct {
 type SummaryData struct {
 	TotalRequests int64   `json:"totalRequests"`
 	TotalAmount   float64 `json:"totalAmount"`
+}
+
+// Batch processing item
+type SummaryItem struct {
+	Prefix        string
+	CorrelationId string
+	Amount        float64
+	Timestamp     int64
 }
 
 // Response structure for /payments-summary endpoint
@@ -188,14 +197,77 @@ func forwardToProcessor(payment PostPayments, processorURL string) bool {
 }
 
 func saveSummaryData(processor string, payment PostPayments) {
-	ctx := context.Background()
-	t, _ := time.Parse("2006-01-02T15:04:05.000Z07:00", payment.RequestedAt)
+	// Convert to batch item
+	ts, _ := time.Parse("2006-01-02T15:04:05.000Z07:00", payment.RequestedAt)
+	item := SummaryItem{
+		Prefix:        processor,
+		CorrelationId: payment.CorrelationId,
+		Amount:        payment.Amount,
+		Timestamp:     ts.UnixMilli(),
+	}
 	
+	// Try to send to batch, if full process directly
+	select {
+	case batchProcessor <- item:
+		// Success - will be processed in batch
+	default:
+		// Batch full - process individually
+		go processSummaryDirect(item)
+	}
+}
+
+func summaryBatchHandler() {
+	// Redis batch aggregator - reduces 90% operations
+	batch := make([]SummaryItem, 0, 1000)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case item := <-batchProcessor:
+			batch = append(batch, item)
+			// Flush when batch is full (1000 items)
+			if len(batch) >= 1000 {
+				processSummaryBatch(batch)
+				batch = batch[:0] // Zero-alloc reset
+			}
+		case <-ticker.C:
+			// Temporal flush every 100ms
+			if len(batch) > 0 {
+				processSummaryBatch(batch)
+				batch = batch[:0]
+			}
+		}
+	}
+}
+
+func processSummaryBatch(batch []SummaryItem) {
+	if len(batch) == 0 {
+		return
+	}
+	
+	ctx := context.Background()
 	pipe := dbClient.Pipeline()
-	pipe.HSet(ctx, "summary:"+processor+":data", payment.CorrelationId, payment.Amount)
-	pipe.ZAdd(ctx, "summary:"+processor+":history", redis.Z{
-		Score:  float64(t.UnixMilli()),
-		Member: payment.CorrelationId,
+	
+	// Add all batch items to Redis pipeline
+	for _, item := range batch {
+		pipe.HSet(ctx, "summary:"+item.Prefix+":data", item.CorrelationId, item.Amount)
+		pipe.ZAdd(ctx, "summary:"+item.Prefix+":history", redis.Z{
+			Score:  float64(item.Timestamp),
+			Member: item.CorrelationId,
+		})
+	}
+	
+	_, _ = pipe.Exec(ctx) // Execute all at once
+}
+
+func processSummaryDirect(item SummaryItem) {
+	ctx := context.Background()
+	pipe := dbClient.Pipeline()
+	pipe.HSet(ctx, "summary:"+item.Prefix+":data", item.CorrelationId, item.Amount)
+	pipe.ZAdd(ctx, "summary:"+item.Prefix+":history", redis.Z{
+		Score:  float64(item.Timestamp),
+		Member: item.CorrelationId,
 	})
 	_, _ = pipe.Exec(ctx)
 }
@@ -205,6 +277,9 @@ func main() {
 	ctx := context.Background()
 	_ = dbClient.FlushAll(ctx).Err()
 
+	// Start batch processor for Redis optimization
+	go summaryBatchHandler()
+	
 	// Start payment processing workers
 	workers, _ := strconv.Atoi(WORKERS)
 	for i := 0; i < workers; i++ {
