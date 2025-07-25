@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -32,6 +33,7 @@ var (
 	// Core infrastructure
 	paymentQueue = make(chan PostPayments, 100_000) // Payment processing queue
 	dbClient     = redis.NewClient(&redis.Options{Addr: REDIS_URL})
+	redisClient  = redis.NewClient(&redis.Options{Addr: REDIS_URL})
 	
 	// HTTP client with natural timeout
 	httpClient = &http.Client{Timeout: 5 * time.Second}
@@ -39,6 +41,7 @@ var (
 	// Concurrency and performance control
 	concurrencyLimiter = make(chan struct{}, 30)      // Concurrent request limiter
 	batchProcessor     = make(chan SummaryItem, 10000) // Batch processing channel
+	bufferPool         = sync.Pool{New: func() interface{} { return &bytes.Buffer{} }}
 	
 	// Ultra-fast JSON for summary
 	jsonFast = jsoniter.ConfigCompatibleWithStandardLibrary
