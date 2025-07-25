@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	jsoniter "github.com/json-iterator/go"
 )
 
 // Configuration
@@ -27,6 +29,10 @@ var (
 	dbClient           = redis.NewClient(&redis.Options{Addr: REDIS_URL})
 	httpClient         = &http.Client{Timeout: 5 * time.Second}
 	concurrencyLimiter = make(chan struct{}, 30)
+	bufferPool         = sync.Pool{New: func() interface{} { return &bytes.Buffer{} }}
+	
+	// Ultra-fast JSON for summary
+	jsonFast = jsoniter.ConfigCompatibleWithStandardLibrary
 )
 
 // Payment structure
@@ -100,7 +106,7 @@ func handlePaymentsSummary(w http.ResponseWriter, r *http.Request) {
 	}
 	
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	_ = jsonFast.NewEncoder(w).Encode(resp)
 }
 
 func getSummaryData(processor string, from, to time.Time) SummaryData {
@@ -158,15 +164,18 @@ func forwardToProcessor(payment PostPayments, processorURL string) bool {
 	concurrencyLimiter <- struct{}{}
 	defer func() { <-concurrencyLimiter }()
 
-	// Create JSON payload
-	body, err := json.Marshal(payment)
-	if err != nil {
+	// Use buffer pool for JSON encoding
+	buf := bufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufferPool.Put(buf)
+
+	if err := jsonFast.NewEncoder(buf).Encode(payment); err != nil {
 		return false
 	}
 
 	// Make HTTP request to processor
 	url := processorURL + "/payments"
-	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(body))
+	req, _ := http.NewRequest("POST", url, buf)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := httpClient.Do(req)
