@@ -71,25 +71,10 @@ func getEnv(key, fallback string) string {
 }
 
 func receivePayment(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	
 	var p PostPayments
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-	
-	// Add to processing queue
-	p.RequestedAt = time.Now().UTC().Format("2006-01-02T15:04:05.000Z07:00")
-	select {
-	case paymentQueue <- p:
-		w.WriteHeader(http.StatusAccepted)
-	default:
-		w.WriteHeader(http.StatusTooManyRequests)
-	}
+	json.NewDecoder(r.Body).Decode(&p)
+	paymentQueue <- p
+	w.WriteHeader(201)
 }
 
 func handlePaymentsSummary(w http.ResponseWriter, r *http.Request) {
