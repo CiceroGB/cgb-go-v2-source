@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
@@ -22,18 +21,17 @@ import (
 // ============================================================================
 
 var (
-	// Payment processor URLs
-	PAYMENT_PROCESSOR_DEFAULT_URL  = getEnv("PAYMENT_PROCESSOR_DEFAULT_URL", "http://localhost:8001")
-	PAYMENT_PROCESSOR_FALLBACK_URL = getEnv("PAYMENT_PROCESSOR_FALLBACK_URL", "http://localhost:8002")
-	
 	// Server configuration
 	PORT      = getEnv("PORT", ":9999")
 	REDIS_URL = getEnv("REDIS_URL", "127.0.0.1:6379")
 	WORKERS   = getEnv("WORKERS", "30")
 
+	// Pre-compiled URLs for performance
+	DEFAULT_PAYMENTS_URL  = getEnv("PAYMENT_PROCESSOR_DEFAULT_URL", "http://localhost:8001") + "/payments"
+	FALLBACK_PAYMENTS_URL = getEnv("PAYMENT_PROCESSOR_FALLBACK_URL", "http://localhost:8002") + "/payments"
+
 	// Core infrastructure
 	paymentQueue = make(chan PostPayments, 100_000) // Payment processing queue
-	dbClient     = redis.NewClient(&redis.Options{Addr: REDIS_URL})
 	redisClient  = redis.NewClient(&redis.Options{Addr: REDIS_URL})
 	
 	// HTTP client with natural timeout
@@ -41,7 +39,10 @@ var (
 	
 	// Concurrency and performance control
 	concurrencyLimiter = make(chan struct{}, 30)      // Concurrent request limiter
-	bufferPool         = sync.Pool{New: func() interface{} { return &bytes.Buffer{} }}
+	bufferPool         = sync.Pool{New: func() interface{} { 
+		buf := make([]byte, 0, 1024)
+		return bytes.NewBuffer(buf)
+	}}
 	
 	// Ultra-fast JSON for summary
 	jsonFast = jsoniter.ConfigCompatibleWithStandardLibrary
@@ -83,7 +84,7 @@ func getEnv(key, fallback string) string {
 func main() {
 	// Clean Redis on startup
 	ctx := context.Background()
-	_ = dbClient.FlushAll(ctx).Err()
+	_ = redisClient.FlushAll(ctx).Err()
 
 	// Start payment processing workers
 	workers, _ := strconv.Atoi(WORKERS)
@@ -127,7 +128,7 @@ func receivePayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var p PostPayments
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+	if err := jsonFast.NewDecoder(r.Body).Decode(&p); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -176,7 +177,7 @@ func processPayments(queue <-chan PostPayments) {
 		// Try default processor with retry
 		processed := false
 		for i := 0; i < 5; i++ {
-			if forwardToProcessor(payment, PAYMENT_PROCESSOR_DEFAULT_URL) {
+			if forwardToProcessor(payment, DEFAULT_PAYMENTS_URL) {
 				processed = true
 				break
 			}
@@ -186,7 +187,7 @@ func processPayments(queue <-chan PostPayments) {
 		// Save only once after processing succeeds
 		if processed {
 			saveSummaryAsync("default", payment)
-		} else if forwardToProcessor(payment, PAYMENT_PROCESSOR_FALLBACK_URL) {
+		} else if forwardToProcessor(payment, FALLBACK_PAYMENTS_URL) {
 			saveSummaryAsync("fallback", payment)
 		}
 		// If both fail, don't save = perfect consistency
@@ -207,9 +208,8 @@ func forwardToProcessor(payment PostPayments, processorURL string) bool {
 		return false
 	}
 
-	// Make HTTP request to processor
-	url := processorURL + "/payments"
-	req, _ := http.NewRequest("POST", url, buf)
+	// Make HTTP request to processor (URL already includes /payments)
+	req, _ := http.NewRequest("POST", processorURL, buf)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := httpClient.Do(req)
