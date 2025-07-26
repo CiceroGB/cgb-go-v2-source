@@ -41,7 +41,6 @@ var (
 	
 	// Concurrency and performance control
 	concurrencyLimiter = make(chan struct{}, 30)      // Concurrent request limiter
-	batchProcessor     = make(chan SummaryItem, 10000) // Batch processing channel
 	bufferPool         = sync.Pool{New: func() interface{} { return &bytes.Buffer{} }}
 	
 	// Ultra-fast JSON for summary
@@ -68,13 +67,7 @@ type PaymentsSummary struct {
 	Fallback SummaryData `json:"fallback"`
 }
 
-// Item for Redis batch processing
-type SummaryItem struct {
-	Prefix        string
-	CorrelationId string
-	Amount        float64
-	Timestamp     int64
-}
+// Direct Redis processing, no batching needed
 
 func getEnv(key, fallback string) string {
 	if val := os.Getenv(key); val != "" {
@@ -98,11 +91,10 @@ func main() {
 		go processPayments(paymentQueue)
 	}
 
-	// Start batch processor for Redis
-	go summaryBatchHandler()
+	// Direct Redis processing, no batch handler needed
 	
 
-	// Configura endpoints HTTP
+	// Setup HTTP handlers
 	setupHTTPHandlers()
 
 	// Ensure PORT has colon prefix
@@ -110,8 +102,8 @@ func main() {
 		PORT = ":" + PORT
 	}
 	
-	// Inicia servidor
-	fmt.Println("Rinha 2025 - Payment Gateway Server running on", PORT)
+	// Start server
+	fmt.Println("Payment Gateway Server running on", PORT)
 	if err := http.ListenAndServe(PORT, nil); err != nil {
 		panic(err)
 	}
@@ -125,7 +117,7 @@ func setupHTTPHandlers() {
 	// POST /payments - Receive and process payments
 	http.HandleFunc("/payments", receivePayment)
 	
-	// GET /payments-summary - Retorna relatório de pagamentos
+	// GET /payments-summary - Returns payment summary
 	http.HandleFunc("/payments-summary", handlePaymentsSummary)
 }
 
@@ -153,7 +145,7 @@ func handlePaymentsSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	// Parse dos parâmetros de data
+	// Parse date parameters
 	from, _ := time.Parse(time.RFC3339, r.URL.Query().Get("from"))
 	to, _ := time.Parse(time.RFC3339, r.URL.Query().Get("to"))
 	if from.IsZero() {
@@ -163,7 +155,7 @@ func handlePaymentsSummary(w http.ResponseWriter, r *http.Request) {
 		to = time.Now().UTC()
 	}
 
-	// Monta resposta com dados do Redis
+	// Build response with Redis data
 	resp := PaymentsSummary{
 		Default:  getSummaryData("default", from, to),
 		Fallback: getSummaryData("fallback", from, to),
@@ -181,7 +173,7 @@ func processPayments(queue <-chan PostPayments) {
 	for payment := range queue {
 		payment.RequestedAt = time.Now().UTC().Format("2006-01-02T15:04:05.000Z07:00")
 
-		// Try default processor with retry (like pgo)
+		// Try default processor with retry
 		processed := false
 		for i := 0; i < 5; i++ {
 			if forwardToProcessor(payment, PAYMENT_PROCESSOR_DEFAULT_URL) {
@@ -206,7 +198,7 @@ func forwardToProcessor(payment PostPayments, processorURL string) bool {
 	concurrencyLimiter <- struct{}{}
 	defer func() { <-concurrencyLimiter }()
 
-	// Usa buffer pool para JSON encoding
+	// Use buffer pool for JSON encoding
 	buf := bufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	defer bufferPool.Put(buf)
@@ -215,14 +207,14 @@ func forwardToProcessor(payment PostPayments, processorURL string) bool {
 		return false
 	}
 
-	// Faz request HTTP para o processador
+	// Make HTTP request to processor
 	url := processorURL + "/payments"
 	req, _ := http.NewRequest("POST", url, buf)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return false // Timeout ou erro de rede
+		return false
 	}
 	defer resp.Body.Close()
 	
@@ -234,86 +226,25 @@ func forwardToProcessor(payment PostPayments, processorURL string) bool {
 // ============================================================================
 
 func saveSummaryAsync(processor string, payment PostPayments) {
-	// Converte para item de batch
+	ctx := context.Background()
 	ts, _ := time.Parse("2006-01-02T15:04:05.000Z07:00", payment.RequestedAt)
-	item := SummaryItem{
-		Prefix:        processor,
-		CorrelationId: payment.CorrelationId,
-		Amount:        payment.Amount,
-		Timestamp:     ts.UnixMilli(),
-	}
 	
-	// Try to send to batch, if full process directly
-	select {
-	case batchProcessor <- item:
-		// Success - will be processed in batch
-	default:
-		// Batch full - process individually
-		go processSummaryDirect(item)
-	}
-}
-
-func summaryBatchHandler() {
-	// Redis batch aggregator - reduces 90% operations
-	batch := make([]SummaryItem, 0, 1000)           // Pre-allocated slice
-	ticker := time.NewTicker(100 * time.Millisecond) // 10 batches/second
-	defer ticker.Stop()
-
-	for {
-		select {
-		case item := <-batchProcessor:
-			batch = append(batch, item)
-			// Flush when batch is full (1000 items)
-			if len(batch) >= 1000 {
-				processSummaryBatch(batch)
-				batch = batch[:0] // Zero-alloc reset
-			}
-		case <-ticker.C:
-			// Temporal flush every 100ms
-			if len(batch) > 0 {
-				processSummaryBatch(batch)
-				batch = batch[:0]
-			}
-		}
-	}
-}
-
-func processSummaryBatch(batch []SummaryItem) {
-	if len(batch) == 0 {
-		return
-	}
-	
-	ctx := context.Background()
 	pipe := redisClient.Pipeline()
-	
-	// Adiciona todos os items do batch ao pipeline Redis
-	for _, item := range batch {
-		pipe.HSet(ctx, "summary:"+item.Prefix+":data", item.CorrelationId, item.Amount)
-		pipe.ZAdd(ctx, "summary:"+item.Prefix+":history", redis.Z{
-			Score:  float64(item.Timestamp),
-			Member: item.CorrelationId,
-		})
-	}
-	
-	_, _ = pipe.Exec(ctx) // Executa tudo de uma vez
-}
-
-func processSummaryDirect(item SummaryItem) {
-	ctx := context.Background()
-	pipe := redisClient.Pipeline()
-	pipe.HSet(ctx, "summary:"+item.Prefix+":data", item.CorrelationId, item.Amount)
-	pipe.ZAdd(ctx, "summary:"+item.Prefix+":history", redis.Z{
-		Score:  float64(item.Timestamp),
-		Member: item.CorrelationId,
+	pipe.HSet(ctx, "summary:"+processor+":data", payment.CorrelationId, payment.Amount)
+	pipe.ZAdd(ctx, "summary:"+processor+":history", redis.Z{
+		Score:  float64(ts.UnixMilli()),
+		Member: payment.CorrelationId,
 	})
 	_, _ = pipe.Exec(ctx)
 }
+
+// Direct Redis processing for consistency
 
 func getSummaryData(processor string, from, to time.Time) SummaryData {
 	ctx := context.Background()
 	result := SummaryData{}
 
-	// Busca IDs dos pagamentos no período
+	// Get payment IDs in time range
 	ids, _ := redisClient.ZRangeByScore(ctx, "summary:"+processor+":history", &redis.ZRangeBy{
 		Min: fmt.Sprint(from.UnixMilli()),
 		Max: fmt.Sprint(to.UnixMilli()),
@@ -323,7 +254,7 @@ func getSummaryData(processor string, from, to time.Time) SummaryData {
 		return result
 	}
 
-	// Busca valores dos pagamentos
+	// Get payment amounts
 	vals, _ := redisClient.HMGet(ctx, "summary:"+processor+":data", ids...).Result()
 	for _, val := range vals {
 		if v, ok := val.(string); ok {
@@ -334,7 +265,7 @@ func getSummaryData(processor string, from, to time.Time) SummaryData {
 		}
 	}
 	
-	// Arredonda para 2 casas decimais
+	// Round to 2 decimal places
 	result.TotalAmount = math.Round(result.TotalAmount*100) / 100
 	return result
 }
