@@ -185,18 +185,17 @@ func processPayments(queue <-chan PostPayments) {
 		processed := false
 		for i := 0; i < 5; i++ {
 			if forwardToProcessor(payment, PAYMENT_PROCESSOR_DEFAULT_URL) {
-				saveSummaryAsync("default", payment)
 				processed = true
 				break
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
 		
-		// If default failed after retries, try fallback once
-		if !processed {
-			if forwardToProcessor(payment, PAYMENT_PROCESSOR_FALLBACK_URL) {
-				saveSummaryAsync("fallback", payment)
-			}
+		// Save only once after processing succeeds
+		if processed {
+			saveSummaryAsync("default", payment)
+		} else if forwardToProcessor(payment, PAYMENT_PROCESSOR_FALLBACK_URL) {
+			saveSummaryAsync("fallback", payment)
 		}
 		// If both fail, don't save = perfect consistency
 	}
