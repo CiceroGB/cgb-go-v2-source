@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -104,6 +105,11 @@ func main() {
 	// Configura endpoints HTTP
 	setupHTTPHandlers()
 
+	// Ensure PORT has colon prefix
+	if !strings.HasPrefix(PORT, ":") {
+		PORT = ":" + PORT
+	}
+	
 	// Inicia servidor
 	fmt.Println("Rinha 2025 - Payment Gateway Server running on", PORT)
 	if err := http.ListenAndServe(PORT, nil); err != nil {
@@ -124,11 +130,21 @@ func setupHTTPHandlers() {
 }
 
 func receivePayment(w http.ResponseWriter, r *http.Request) {
-	// Ultra-minimal endpoint: zero overhead
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	var p PostPayments
-	json.NewDecoder(r.Body).Decode(&p)
-	w.WriteHeader(http.StatusCreated)
-	paymentQueue <- p
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	select {
+	case paymentQueue <- p:
+		w.WriteHeader(http.StatusCreated)
+	default:
+		w.WriteHeader(http.StatusTooManyRequests)
+	}
 }
 
 func handlePaymentsSummary(w http.ResponseWriter, r *http.Request) {
@@ -163,21 +179,15 @@ func handlePaymentsSummary(w http.ResponseWriter, r *http.Request) {
 
 func processPayments(queue <-chan PostPayments) {
 	for payment := range queue {
-		// Timestamp apenas quando realmente processar
 		payment.RequestedAt = time.Now().UTC().Format("2006-01-02T15:04:05.000Z07:00")
 
-		// Strategy: Default first (lower fee = more profit)
-		processorUsed := "none"
+		// Only save if actually processed successfully
 		if forwardToProcessor(payment, PAYMENT_PROCESSOR_DEFAULT_URL) {
-			processorUsed = "default"
+			saveSummaryAsync("default", payment)
 		} else if forwardToProcessor(payment, PAYMENT_PROCESSOR_FALLBACK_URL) {
-			processorUsed = "fallback"
+			saveSummaryAsync("fallback", payment)
 		}
-		
-		// Save result if processed successfully
-		if processorUsed != "none" {
-			saveSummaryAsync(processorUsed, payment)
-		}
+		// If both fail, don't save = perfect consistency
 	}
 }
 

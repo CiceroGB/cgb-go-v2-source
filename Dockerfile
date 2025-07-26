@@ -1,17 +1,13 @@
-FROM golang:1.21-alpine AS builder
-
+FROM golang:1.24-alpine AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
-
-COPY . .
-RUN go build -o payment-gateway .
+COPY ./ /app
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o api .
+RUN apk add --no-cache file
+RUN file api
 
 FROM alpine:latest
-RUN apk --no-cache add ca-certificates
-WORKDIR /root/
-
-COPY --from=builder /app/payment-gateway .
-
-EXPOSE 80
-CMD ["./payment-gateway"]
+COPY --from=builder /app/api /usr/local/bin/
+RUN chmod +x /usr/local/bin/api
+CMD ["api"]
