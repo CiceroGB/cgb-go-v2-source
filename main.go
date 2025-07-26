@@ -181,11 +181,22 @@ func processPayments(queue <-chan PostPayments) {
 	for payment := range queue {
 		payment.RequestedAt = time.Now().UTC().Format("2006-01-02T15:04:05.000Z07:00")
 
-		// Only save if actually processed successfully
-		if forwardToProcessor(payment, PAYMENT_PROCESSOR_DEFAULT_URL) {
-			saveSummaryAsync("default", payment)
-		} else if forwardToProcessor(payment, PAYMENT_PROCESSOR_FALLBACK_URL) {
-			saveSummaryAsync("fallback", payment)
+		// Try default processor with retry (like pgo)
+		processed := false
+		for i := 0; i < 5; i++ {
+			if forwardToProcessor(payment, PAYMENT_PROCESSOR_DEFAULT_URL) {
+				saveSummaryAsync("default", payment)
+				processed = true
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		
+		// If default failed after retries, try fallback once
+		if !processed {
+			if forwardToProcessor(payment, PAYMENT_PROCESSOR_FALLBACK_URL) {
+				saveSummaryAsync("fallback", payment)
+			}
 		}
 		// If both fail, don't save = perfect consistency
 	}
